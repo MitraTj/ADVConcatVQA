@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from pytorch_transformers.modeling_bert import (
     BertConfig,
-    BertEmbeddings,
+    #BertEmbeddings,
     BertIntermediate,
     BertLayerNorm,
     BertOutput,
@@ -338,13 +338,15 @@ class MMT(nn.Module):
         self.dest_transform = SimpleClassifier(self.mmt_config.hidden_size, 128, 32)
         self.spatial_classifier = nn.Linear(32, 12)
 
-    def forward(self, batch_dict):
+    #def forward(self, batch_dict):
+    def forward(self, batch_dict, adv_training=False, adv_delta_txt=None, adv_delta_img=None):
         self._forward_mmt_and_text(batch_dict)
         self._forward_output(batch_dict)
 
         if registry.freeze_textbert_and_mmt:
             results_dict = {
                 "vil_prediction": batch_dict["lc_out"],
+                #"vil_prediction_gqa": batch_dict["lc_out"],
                 "contastive_projection_norm": None,
                 "attention_weights": None,
             }
@@ -362,13 +364,16 @@ class MMT(nn.Module):
         }
         return results_dict
 
-    def _forward_mmt_and_text(self, batch_dict):
+    #def _forward_mmt_and_text(self, batch_dict):
+    def _forward_mmt_and_text(self, batch_dict,adv_training=False, adv_delta_txt=None, adv_delta_img=None):
+        
         if self.freeze_mmt_and_textbert:
             self.text_bert.eval()
             self.mmt.eval()
 
         # first forward the text BERT layers
-        text_bert_out = self.text_bert(batch_dict)
+        #text_bert_out = self.text_bert(batch_dict)
+        text_bert_out = self.text_bert(batch_dict, adv_training, adv_delta_txt)
         batch_dict["text_bert_emb"] = self.text_bert_out_linear(text_bert_out)
 
         mmt_results = self.mmt(batch_dict)
@@ -390,6 +395,7 @@ class MMT(nn.Module):
 
         if registry.freeze_textbert_and_mmt:
             batch_dict["lc_out"] = self.linear_classifier(batch_dict["vil_prediction"])
+            #batch_dict["lc_out"] = self.linear_classifier(batch_dict["vil_prediction_gqa"])
             return
 
         if hasattr(self.mmt_config, "contrastive") and self.mmt_config.contrastive in [
@@ -462,7 +468,8 @@ class TextBert(BertPreTrainedModel):
         # self.apply(self.init_weights)  # old versions of pytorch_transformers
         self.init_weights()
 
-    def forward(self, batch_dict):
+    #def forward(self, batch_dict):
+    def forward(self, batch_dict, adv_training, adv_delta_txt):
         encoder_inputs = self.embeddings(batch_dict["question_indices"])
         attention_mask = batch_dict["question_mask"]
 
@@ -478,7 +485,49 @@ class TextBert(BertPreTrainedModel):
 
         return seq_output
 
+class BertEmbeddings(nn.Module):
+    """Construct the embeddings from word, position and token_type embeddings."""
 
+    def __init__(self, config):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(30522, config.hidden_size, padding_idx=0)   ##config.vocab_size:30522
+        self.position_embeddings = nn.Embedding(512, config.hidden_size)   ##config.max_position_embeddings
+        self.token_type_embeddings = nn.Embedding(2, config.hidden_size)
+
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=1e-12)
+        self.dropout = nn.Dropout(0.1)
+        self.register_buffer("position_ids", torch.arange(512).expand((1, -1)))
+
+    def forward(self, input_ids, adv_training, adv_delta_txt):
+        #if input_ids is not None:
+        #    input_shape = input_ids.size()
+        #else:
+        #    input_shape = inputs_embeds.size()[:-1]
+
+        input_shape = input_ids.size()
+
+        seq_length = input_shape[1]
+
+        #if position_ids is None:
+        position_ids = self.position_ids[:, :seq_length]
+
+        #if token_type_ids is None:
+        token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
+
+        #if inputs_embeds is None:
+        inputs_embeds = self.word_embeddings(input_ids)
+
+        if adv_training == True:
+        ##if adv_training == True and not adv_delta_txt is None:
+            inputs_embeds = inputs_embeds + adv_delta_txt
+        position_embeddings = self.position_embeddings(position_ids)
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+
+        embeddings = inputs_embeds + position_embeddings + token_type_embeddings
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
+        
 class BertImageEmbeddings(nn.Module):
     """Construct the embeddings from image, spatial location (omit now) and token_type embeddings."""
 
@@ -490,7 +539,16 @@ class BertImageEmbeddings(nn.Module):
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, input_loc):
+    #def forward(self, input_ids, input_loc):
+    def forward(self, img_feat, img_pos_feat, adv_training, adv_delta_img, img_masks=None):
+        if img_masks is not None:
+            self.mask_embedding.weight.data[0, :].fill_(0)
+            mask = self.mask_embedding(img_masks.long())
+            img_feat = img_feat + mask
+            
+        if adv_training == True:
+            img_feat = img_feat + adv_delta_img  
+            
         img_embeddings = self.image_embeddings(input_ids)
         loc_embeddings = self.image_location_embeddings(input_loc)
         type_ids = input_ids.new_zeros(img_embeddings.shape[:-1], dtype=torch.long)
@@ -528,7 +586,7 @@ class MMT_VQA(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.image_embeddings = BertImageEmbeddings(config)
-        # self.text_embeddings = BertEmbeddings(config)
+        self.text_embeddings = BertEmbeddings(config)
         # Add this when TextBERT is identity function,
         self.encoder = BertEncoder(config)
         self.text_pooler = BertTextPooler(config)
@@ -537,22 +595,26 @@ class MMT_VQA(BertPreTrainedModel):
         # self.apply(self.init_weights)  # old versions of pytorch_transformers
         self.init_weights()
 
-    def forward(self, batch_dict):
+    #def forward(self, batch_dict):
+    def forward(self, batch_dict, adv_training=False, adv_delta_txt=None, adv_delta_img=None, img_masks=None, img_type_ids=None):
 
         text_embeddings = batch_dict["text_bert_emb"]
         # text_embeddings = self.text_embeddings(batch_dict["question_indices"])
         image_embeddings = self.image_embeddings(
-            batch_dict["input_imgs"], batch_dict["image_loc"]
+            batch_dict["input_imgs"], batch_dict["image_loc"], adv_training, adv_delta_img
         )
+        #image_embeddings = self.image_embeddings(
+        #    batch_dict["input_imgs"]+batch_dict["image_mask"], batch_dict["image_loc"], adv_training, adv_delta_img)
 
         joint_embeddings = torch.cat([text_embeddings, image_embeddings], dim=1)
         joint_mask = torch.cat(
             [batch_dict["question_mask"], batch_dict["image_mask"]], dim=-1
         )
         extended_attention_mask = joint_mask.unsqueeze(1).unsqueeze(2)
-        extended_attention_mask = extended_attention_mask.to(
-            dtype=next(self.parameters()).dtype
-        )  # fp16 compatibility
+        #extended_attention_mask = extended_attention_mask.to(
+        #    dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = extended_attention_mask.to(dtype=torch.float32) # fp16 compatibility
+        #extended_attention_mask = extended_attention_mask.to(dtype=input_ids.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         assert not extended_attention_mask.requires_grad
         head_mask = [None] * self.config.num_hidden_layers
